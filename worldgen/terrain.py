@@ -218,17 +218,15 @@ def generate():
     landmask = _smoothstep(continental, threshold - 0.015, threshold + 0.015)
     land = landmask > 0.5
 
-    # 2. 多尺度 FBM 细节
+    # 2. 多尺度 FBM 细节（标准化为近似标准正态，便于控制山地范围）
     detail = fbm((size, size), config.NUM_OCTAVES, seed + 5000, base_cells=8)
-    detail = (detail - 0.5) * 2.0  # 归一化到 [-1, 1]
+    detail = (detail - detail.mean()) / (detail.std() + 1e-9)
 
     # 3. 组合高度
     elev = np.clip((landmask - 0.5) * 2.0, 0.0, 1.0)  # 海岸 0 -> 内陆 1
-    land_height = (
-        elev * 2000.0
-        + elev * np.clip(detail, 0.0, 1.0) * 3200.0
-        + np.clip(detail, 0.0, 1.0) * 800.0
-    )
+    # 基础低地随内陆略抬升；山地集中在细节噪声的高值区（形成山脉）
+    mountain = np.clip((detail - 0.2) / 2.0, 0.0, 1.0) ** 1.4
+    land_height = elev * 250.0 + mountain * 5400.0 * (0.2 + 0.8 * elev)
     # 距离变换：edt 计算到最近背景(False)的距离，故取反得到「距最近陆地」
     dist_land = distance_transform_edt(~land)
     ocean_depth = np.clip(-80.0 - 250.0 * np.sqrt(dist_land) - 20.0 * dist_land, -8000.0, 0.0)
