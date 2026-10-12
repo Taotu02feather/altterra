@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 生成的输出与数据（不纳入版本控制）
+output/
+*.png
+*.npy
+*.npz
+

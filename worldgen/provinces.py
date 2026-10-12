@@ -214,6 +214,13 @@ def generate(height, biome):
     # 清除过小的碎屑省份
     labels = _merge_small(labels, land, min_area=100)
 
+    # 重编号为连续 id（1..N）
+    uniq = np.unique(labels)
+    uniq = uniq[uniq > 0]
+    mapping = np.zeros(int(labels.max()) + 1, dtype=np.int32)
+    mapping[uniq] = np.arange(1, len(uniq) + 1, dtype=np.int32)
+    labels = mapping[labels]
+
     # 缓存标签图供 render 使用
     global _LABELS
     _LABELS = labels
