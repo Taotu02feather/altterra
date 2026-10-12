@@ -1,0 +1,41 @@
+# 输出（Cline 读 PNG 会浪费大量 token）
+output/
+*.png
+*.jpg
+*.jpeg
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 大二进制数据
+*.npy
+*.npz
+*.h5
+*.pkl
+data/raw/
+
+# Git 内部
+.git/
+.gitignore
+
+# 编辑器
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+
+# 依赖锁文件（很长，Cline 不需要看）
+package-lock.json
+poetry.lock
+Pipfile.lock
