@@ -81,17 +81,6 @@ def _boundary_mask(labels):
     return right | down
 
 
-def _farm_capacity(height, temp, rain):
-    """逐像素农业承载力（0~1），与 resources 一致。"""
-    land = height >= 0
-    temp_ok = np.exp(-((temp - 22.0) / 15.0) ** 2)
-    rain_ok = np.exp(-((rain - 0.65) / 0.4) ** 2)
-    gx = np.gradient(np.maximum(height, 0.0), axis=1)
-    gy = np.gradient(np.maximum(height, 0.0), axis=0)
-    slope_ok = np.clip(1.0 - np.hypot(gx, gy) / 250.0, 0.0, 1.0)
-    return np.where(land, temp_ok * rain_ok * slope_ok, 0.0)
-
-
 def _resource_info(p):
     """返回省份的主导资源名与颜色。"""
     n = {
@@ -150,46 +139,76 @@ def _render_world_map(height, biome, provs):
     plt.close(fig)
 
 
-def _render_capacity(height, temp, rain):
+def _ocean_overlay(land, color):
+    """生成海洋覆盖 RGBA（海洋不透明、陆地透明），用于盖回多边形延伸到海洋的部分。"""
+    h, w = land.shape
+    overlay = np.zeros((h, w, 4), dtype=np.float64)
+    overlay[~land, 0] = color[0]
+    overlay[~land, 1] = color[1]
+    overlay[~land, 2] = color[2]
+    overlay[~land, 3] = 1.0
+    return overlay
+
+
+def _polygon_data(p, H):
+    """把省份多边形顶点（像素坐标 x=列,y=行）转成数据坐标 (x, H-y)。"""
+    xs = [pt[0] for pt in p["polygon"]]
+    ys = [H - pt[1] for pt in p["polygon"]]
+    return xs, ys
+
+
+def _render_capacity(height, provs):
     W, H = height.shape[1], height.shape[0]
     land = height >= 0
-    cap = _farm_capacity(height, temp, rain)
-
-    # 陆地：浅黄 -> 深绿；海洋：深蓝
     cmap = plt.get_cmap('YlGn')
-    rgb = np.zeros((H, W, 3), dtype=np.float64)
-    rgb[land] = cmap(cap[land])[..., :3]
-    rgb[~land] = np.array([0.04, 0.12, 0.35])  # 海洋深蓝
 
     fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
-    ax.imshow(rgb, extent=[0, W, H, 0], interpolation='nearest')
+    ax.set_xlim(0, W)
+    ax.set_ylim(0, H)
+
+    # 每个省份用 matplotlib Polygon 填充，颜色由该省 farm 潜力决定（浅黄 -> 深绿）
+    for p in provs:
+        if len(p["polygon"]) < 3:
+            continue
+        xs, ys = _polygon_data(p, H)
+        ax.fill(xs, ys, facecolor=cmap(p["farm"]), edgecolor='none')
+
+    # 盖回海洋（多边形是裁剪到地图边界的 Voronoi 区域，会延伸到海洋）
+    ax.imshow(_ocean_overlay(land, (0.04, 0.12, 0.35)),
+              extent=[0, W, H, 0], interpolation='nearest', origin='upper')
+
     ax.set_axis_off()
     fig.savefig(os.path.join('output', 'capacity.png'))
     plt.close(fig)
 
 
-def _render_provinces():
-    labels = _prov_mod.label_map()
-    if labels is None:
-        return
-    W, H = labels.shape[1], labels.shape[0]
-    n = int(labels.max()) + 1
+def _render_provinces(height, provs):
+    W, H = height.shape[1], height.shape[0]
+    land = height >= 0
+    n = len(provs)
 
     # 黄金角分配色相，保证相邻省份颜色区分（确定性）
     hues = (np.arange(n, dtype=np.float64) * 0.61803398875 + 0.15) % 1.0
     sat = np.full(n, 0.62)
     val = np.full(n, 0.92)
     colors = hsv_to_rgb(np.stack([hues, sat, val], axis=1))
-    colors[0] = [0.13, 0.18, 0.32]  # 海洋深蓝灰
-
-    rgb = colors[labels.astype(np.int64)]
-    bnd = _boundary_mask(labels)
-    rgb[bnd] = [1.0, 1.0, 1.0]  # 白色细边界
 
     fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
-    ax.imshow(rgb, extent=[0, W, H, 0], interpolation='nearest')
+    ax.set_xlim(0, W)
+    ax.set_ylim(0, H)
+
+    # 每省随机色填充 + 白色细边界
+    for i, p in enumerate(provs):
+        if len(p["polygon"]) < 3:
+            continue
+        xs, ys = _polygon_data(p, H)
+        ax.fill(xs, ys, facecolor=colors[i], edgecolor='white', linewidth=0.4)
+
+    ax.imshow(_ocean_overlay(land, (0.13, 0.18, 0.32)),
+              extent=[0, W, H, 0], interpolation='nearest', origin='upper')
+
     ax.set_axis_off()
     fig.savefig(os.path.join('output', 'provinces.png'))
     plt.close(fig)
@@ -199,8 +218,8 @@ def render_all(height, biome, provs, temp, rain):
     """渲染三张地图。"""
     os.makedirs('output', exist_ok=True)
     _render_world_map(height, biome, provs)
-    _render_capacity(height, temp, rain)
-    _render_provinces()
+    _render_capacity(height, provs)
+    _render_provinces(height, provs)
 
 
 if __name__ == "__main__":

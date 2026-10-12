@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-provinces.py — Voronoi + 分水岭省份划分
+provinces.py — 纯 Voronoi 省份划分
 
 流程：
 1. 密度函数（承载力 + 地形复杂度 + 沿海加成）
 2. 加权泊松盘采样撒种子点（密度高的地方点多）
-3. Lloyd 松弛 2 次（Voronoi 质心迭代）
-4. 离散 Voronoi 划分（最近邻，用 cKDTree 实现）
-5. scipy.ndimage.watershed_ift 沿山脊修正边界
+3. Lloyd 松弛 5 次（Voronoi 质心迭代）
+4. 纯 Voronoi 划分（scipy.spatial.Voronoi），直接得到凸多边形
+5. 面积过滤：面积 < 中位数 10% 的省份合并到邻居
 
 输出：provinces 列表，每项含 id / polygon / center / area / biome。
-polygon 与 center 均为像素坐标（x=列, y=行）。
+polygon 为 Voronoi 区域顶点（像素坐标，x=列, y=行），center 为像素坐标。
 """
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, watershed_ift, binary_dilation, gaussian_filter
-from scipy.spatial import cKDTree
+from scipy.ndimage import distance_transform_edt
+from scipy.spatial import cKDTree, Voronoi, ConvexHull
 
 from . import config
 
@@ -31,7 +31,8 @@ def label_map():
 def _density(height, biome):
     """密度函数：承载力 + 地形复杂度 + 沿海加成。"""
     land = height >= 0
-    cap_weights = np.array([0.0, 0.05, 0.15, 0.40, 0.80, 0.50, 0.05, 0.50, 1.00, 0.10])
+    # 承载力权重跨度较大，使肥沃区省份小而贫瘠区省份大（面积比约 20~100）
+    cap_weights = np.array([0.0, 0.01, 0.05, 0.30, 0.85, 0.45, 0.01, 0.45, 2.00, 0.03])
     capacity = cap_weights[np.clip(biome, 0, 9).astype(np.int64)]
     gx = np.gradient(np.maximum(height, 0.0), axis=1)
     gy = np.gradient(np.maximum(height, 0.0), axis=0)
@@ -83,12 +84,19 @@ def _weighted_poisson_disk(density, land, n, rng, min_dist):
     return points[:n]
 
 
-def _lloyd(points, land, iters):
-    """Lloyd 松弛：把每个种子移到其 Voronoi 胞元的质心。"""
+def _lloyd(points, land, iters, weights=None):
+    """Lloyd 松弛：把每个种子移到其 Voronoi 胞元的（密度加权）质心。
+
+    weights 为逐像素密度场；按密度加权质心，使胞元面积 ∝ 1/密度（保留大小差异）。
+    """
     if len(points) == 0:
         return np.zeros((0, 2), dtype=np.float64)
     ys, xs = np.nonzero(land)
     land_coords = np.c_[ys.astype(np.float64), xs.astype(np.float64)]
+    if weights is None:
+        w = np.ones(len(ys), dtype=np.float64)
+    else:
+        w = weights[ys, xs].astype(np.float64)
     pts = np.asarray(points, dtype=np.float64)
     tree = cKDTree(pts)
     for _ in range(iters):
@@ -97,8 +105,14 @@ def _lloyd(points, land, iters):
         for i in range(len(pts)):
             sel = lab == i
             if sel.any():
-                new_pts[i, 0] = ys[sel].mean()
-                new_pts[i, 1] = xs[sel].mean()
+                ws = w[sel]
+                sw = float(ws.sum())
+                if sw > 0:
+                    new_pts[i, 0] = float((ys[sel] * ws).sum() / sw)
+                    new_pts[i, 1] = float((xs[sel] * ws).sum() / sw)
+                else:
+                    new_pts[i, 0] = float(ys[sel].mean())
+                    new_pts[i, 1] = float(xs[sel].mean())
             else:
                 new_pts[i] = pts[i]
         pts = new_pts
@@ -106,64 +120,178 @@ def _lloyd(points, land, iters):
     return pts
 
 
-def _merge_small(labels, land, min_area):
-    """把面积过小的省份并入共享边界最长的相邻省份，清除碎屑。"""
-    ids, counts = np.unique(labels[land], return_counts=True)
-    struct = np.ones((3, 3), dtype=bool)
-    for pid, cnt in zip(ids, counts):
-        if cnt >= min_area or pid == 0:
-            continue
-        mask = labels == pid
-        nb = binary_dilation(mask, structure=struct)
-        nbr = labels[nb & ~mask]
-        nbr = nbr[(nbr != pid) & (nbr != 0)]
-        if len(nbr) == 0:
-            continue
-        uniq, cnts = np.unique(nbr, return_counts=True)
-        target = uniq[np.argmax(cnts)]
-        labels[mask] = target
-    return labels
+def _filter_by_area(points, land):
+    """删除陆地面积极小的种子（面积 < 中位数 10%），让邻居吸收其区域。"""
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    ys, xs = np.nonzero(land)
+    land_coords = np.c_[ys.astype(np.float64), xs.astype(np.float64)]
+    pts = np.asarray(points, dtype=np.float64)
+    tree = cKDTree(pts)
+    _, lab = tree.query(land_coords)
+    counts = np.bincount(lab, minlength=len(pts)).astype(np.float64)
+    pos = counts[counts > 0]
+    if len(pos) == 0:
+        return pts
+    threshold = max(1.0, 0.10 * float(np.median(pos)))
+    keep = counts >= threshold
+    if keep.all():
+        return pts
+    return pts[keep]
 
 
-def _extract(labels, height, biome, land):
-    """从标签图提取省份信息。"""
-    from scipy.ndimage import binary_erosion, generate_binary_structure
-
-    struct = generate_binary_structure(2, 2)  # 8 连通
-    provinces = []
-    ids = np.unique(labels)
-    ids = ids[ids > 0]
-    for pid in ids:
-        mask = labels == pid
-        area = int(mask.sum())
-        if area == 0:
+def _voronoi_finite_polygons(vor, radius):
+    """把 2D Voronoi 的无界区域重构为有界多边形，返回 (regions, vertices)。"""
+    new_regions = []
+    new_vertices = vor.vertices.tolist()
+    center = vor.points.mean(axis=0)
+    all_ridges = {}
+    for (p1, p2), (v1, v2) in zip(vor.ridge_points, vor.ridge_vertices):
+        all_ridges.setdefault(p1, []).append((p2, v1, v2))
+        all_ridges.setdefault(p2, []).append((p1, v1, v2))
+    for p1, region in enumerate(vor.point_region):
+        vertices = vor.regions[region]
+        if all(v >= 0 for v in vertices):
+            new_regions.append(vertices)
             continue
-        ys, xs = np.nonzero(mask)
-        cx = float(xs.mean())
-        cy = float(ys.mean())
-        b = biome[mask]
-        biome_code = int(np.bincount(b.ravel(), minlength=10).argmax())
-        # 边界像素，按质心角度排序得到多边形（x=列, y=行）
-        boundary = mask & ~binary_erosion(mask, structure=struct)
-        yb, xb = np.nonzero(boundary)
-        if len(yb) >= 3:
-            ang = np.arctan2(yb - cy, xb - cx)
-            order = np.argsort(ang)
-            poly = [(float(xb[i]), float(yb[i])) for i in order]
-        else:
-            poly = [(float(x), float(y)) for y, x in zip(ys, xs)]
-        provinces.append({
-            "id": int(pid),
-            "polygon": poly,
-            "center": (cx, cy),  # 像素坐标 (x=列, y=行)
-            "area": area,
-            "biome": config.BIOME_NAMES[biome_code],
-        })
-    return provinces
+        ridges = all_ridges[p1]
+        new_region = [v for v in vertices if v >= 0]
+        for p2, v1, v2 in ridges:
+            if v2 < 0:
+                v1, v2 = v2, v1
+            if v1 >= 0:
+                t1 = vor.points[p2] - vor.points[p1]
+                t1 = t1 / (np.linalg.norm(t1) + 1e-12)
+                n = np.array([-t1[1], t1[0]])
+                midpoint = vor.points[[p1, p2]].mean(axis=0)
+                direction = np.sign(np.dot(midpoint - center, n)) * n
+                far_point = vor.vertices[v2] + direction * radius
+                new_region.append(len(new_vertices))
+                new_vertices.append(far_point.tolist())
+            if v2 >= 0:
+                t1 = vor.points[p2] - vor.points[p1]
+                t1 = t1 / (np.linalg.norm(t1) + 1e-12)
+                n = np.array([-t1[1], t1[0]])
+                midpoint = vor.points[[p1, p2]].mean(axis=0)
+                direction = np.sign(np.dot(midpoint - center, n)) * n
+                far_point = vor.vertices[v1] + direction * radius
+                new_region.append(len(new_vertices))
+                new_vertices.append(far_point.tolist())
+        vs = np.asarray([new_vertices[v] for v in new_region])
+        # 用凸包排序，保证得到严格凸多边形（角点区域比角度排序更稳健）
+        if len(vs) >= 3:
+            try:
+                hull = ConvexHull(vs)
+                new_region = [new_region[i] for i in hull.vertices]
+            except Exception:
+                c = vs.mean(axis=0)
+                angles = np.arctan2(vs[:, 1] - c[1], vs[:, 0] - c[0])
+                new_region = [new_region[i] for i in np.argsort(angles)]
+        new_regions.append(new_region)
+    return new_regions, np.asarray(new_vertices)
+
+
+def _clip_polygon_rect(poly, xmin, ymin, xmax, ymax):
+    """Sutherland-Hodgman 多边形裁剪到矩形。poly: (n,2) [x,y]。"""
+    poly = np.asarray(poly, dtype=np.float64)
+    if poly.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+
+    def inside(p, e):
+        x, y = p
+        if e == 0:
+            return x >= xmin
+        if e == 1:
+            return x <= xmax
+        if e == 2:
+            return y >= ymin
+        return y <= ymax
+
+    def inter(p1, p2, e):
+        x1, y1 = p1
+        x2, y2 = p2
+        if e in (0, 1):
+            x = xmin if e == 0 else xmax
+            t = (x - x1) / (x2 - x1)
+            return np.array([x, y1 + t * (y2 - y1)])
+        y = ymin if e == 2 else ymax
+        t = (y - y1) / (y2 - y1)
+        return np.array([x1 + t * (x2 - x1), y])
+
+    result = poly
+    for e in range(4):
+        if result.shape[0] == 0:
+            return result
+        new = []
+        prev = result[-1]
+        prev_in = inside(prev, e)
+        for p in result:
+            cur_in = inside(p, e)
+            if cur_in:
+                if not prev_in:
+                    new.append(inter(prev, p, e))
+                new.append(p)
+            elif prev_in:
+                new.append(inter(prev, p, e))
+            prev = p
+            prev_in = cur_in
+        result = np.asarray(new, dtype=np.float64)
+    return result
+
+
+def _dedupe_polygon(poly):
+    """移除相邻重复顶点（含首尾闭合重复），避免退化多边形。"""
+    if poly.shape[0] == 0:
+        return poly
+    keep = [0]
+    for i in range(1, poly.shape[0]):
+        if np.abs(poly[i] - poly[keep[-1]]).max() > 1e-6:
+            keep.append(i)
+    poly = poly[keep]
+    if poly.shape[0] > 1 and np.abs(poly[0] - poly[-1]).max() <= 1e-6:
+        poly = poly[:-1]
+    return poly
+
+
+def _voronoi_polygons(points, w, h):
+    """对每个种子点求 Voronoi 多边形（裁剪到 [0,w]x[0,h]，顶点为像素坐标 [x,y]）。"""
+    pts_xy = np.asarray(points, dtype=np.float64)[:, ::-1]  # (y,x) -> (x,y)
+    vor = Voronoi(pts_xy)
+    radius = float(max(w, h)) * 4.0
+    regions, vertices = _voronoi_finite_polygons(vor, radius)
+    polys = []
+    for region in regions:
+        poly = vertices[region] if len(region) > 0 else np.zeros((0, 2))
+        poly = _clip_polygon_rect(poly, 0.0, 0.0, float(w), float(h))
+        poly = _dedupe_polygon(poly)
+        polys.append([(float(x), float(y)) for x, y in poly])
+    return polys
+
+
+def _rasterize(points, land, biome, h, w):
+    """离散 Voronoi 标签图（仅陆地）+ 每个种子的陆地面积与群系众数。"""
+    n = len(points)
+    labels = np.zeros((h, w), dtype=np.int32)
+    areas = np.zeros(n, dtype=np.int64)
+    biome_codes = np.zeros(n, dtype=np.int64)
+    if n == 0:
+        return labels, areas, biome_codes
+    ys, xs = np.nonzero(land)
+    land_coords = np.c_[ys.astype(np.float64), xs.astype(np.float64)]
+    tree = cKDTree(np.asarray(points, dtype=np.float64))
+    _, lab = tree.query(land_coords)
+    labels[ys, xs] = (lab + 1).astype(np.int32)  # id 从 1 开始
+    areas = np.bincount(lab, minlength=n).astype(np.int64)
+    for i in range(n):
+        m = lab == i
+        if m.any():
+            vals = biome[ys[m], xs[m]]
+            biome_codes[i] = int(np.bincount(vals, minlength=10).argmax())
+    return labels, areas, biome_codes
 
 
 def generate(height, biome):
-    """划分省份。"""
+    """划分省份（纯 Voronoi，无分水岭）。"""
     h, w = height.shape
     land = height >= 0
     rng = np.random.default_rng(config.SEED + 3)
@@ -174,58 +302,42 @@ def generate(height, biome):
     if land_count == 0:
         return []
 
-    # 过采样种子，以抵消后续合并碎屑，最终接近 NUM_PROVINCES
-    n_seeds = int(round(n * 1.8))
-    # 最小间距：按平均胞元间距缩放
-    min_dist = max(6, int(round(np.sqrt(land_count / max(n_seeds, 1)) * 0.7)))
+    # 1. 加权泊松盘撒种子（略过采样，供面积过滤后仍接近 NUM_PROVINCES）
+    n_seeds = int(round(n * 1.05))
+    min_dist = max(6, int(round(np.sqrt(land_count / max(n_seeds, 1)) * 0.35)))
     points = _weighted_poisson_disk(density, land, n_seeds, rng, min_dist)
-    points = _lloyd(points, land, 2)
+    if len(points) == 0:
+        return []
 
-    # 最近陆地索引（用于把种子吸附到陆地）
-    _, land_idx = distance_transform_edt(~land, return_indices=True)
+    # 2. Lloyd 松弛 5 次（密度加权；用 density^2.5 强化密度对比，使面积比落到 20~100）
+    weights = density ** 2.5
+    points = _lloyd(points, land, 5, weights=weights)
 
-    # 种子取整并吸附到陆地，去重后写入标记
-    seen = set()
-    markers = np.zeros((h, w), dtype=np.int32)
-    label = 1
-    for y, x in points:
-        yy = int(round(y))
-        xx = int(round(x))
-        yy = min(max(yy, 0), h - 1)
-        xx = min(max(xx, 0), w - 1)
-        if not land[yy, xx]:
-            yy = int(land_idx[0, yy, xx])
-            xx = int(land_idx[1, yy, xx])
-        if (yy, xx) in seen:
-            continue
-        seen.add((yy, xx))
-        markers[yy, xx] = label
-        label += 1
+    # 3. 面积过滤（面积 < 中位数 10% 的删除），再松弛收尾
+    points = _filter_by_area(points, land)
+    points = _lloyd(points, land, 3, weights=weights)
 
-    # 成本图：海拔作为成本（低=谷、高=脊），叠加中波长平滑噪声，使平坦低地也能
-    # 被自然切分（近似均匀），而山地仍以山脊为主；海洋设为极大值充当分水岭屏障
-    smooth = gaussian_filter(rng.random((h, w)), sigma=25.0)
-    smooth = (smooth - smooth.mean()) / (smooth.std() + 1e-9)
-    cost = np.where(land, height.astype(np.float64) + 8000.0 + smooth * 350.0, 65535.0)
-    cost = np.clip(cost, 0.0, 65535.0).astype(np.uint16)
-    labels = watershed_ift(cost, markers)
-    labels = np.where(land, labels, 0)
+    # 4. 纯 Voronoi 多边形（裁剪到地图边界，顶点为像素坐标）
+    polys = _voronoi_polygons(points, w, h)
 
-    # 清除过小的碎屑省份
-    labels = _merge_small(labels, land, min_area=100)
+    # 5. 离散 Voronoi 标签图（仅陆地）+ 面积 + 群系
+    labels, areas, biome_codes = _rasterize(points, land, biome, h, w)
 
-    # 重编号为连续 id（1..N）
-    uniq = np.unique(labels)
-    uniq = uniq[uniq > 0]
-    mapping = np.zeros(int(labels.max()) + 1, dtype=np.int32)
-    mapping[uniq] = np.arange(1, len(uniq) + 1, dtype=np.int32)
-    labels = mapping[labels]
-
-    # 缓存标签图供 render 使用
+    # 缓存标签图供 render / resources 使用
     global _LABELS
     _LABELS = labels
 
-    return _extract(labels, height, biome, land)
+    # 6. 组装省份列表
+    provs = []
+    for i in range(len(points)):
+        provs.append({
+            "id": i + 1,
+            "polygon": polys[i],  # Voronoi 顶点 (x=列, y=行)
+            "center": (float(points[i, 1]), float(points[i, 0])),  # (x, y) 像素坐标
+            "area": int(areas[i]),
+            "biome": config.BIOME_NAMES[int(biome_codes[i])],
+        })
+    return provs
 
 
 if __name__ == "__main__":
@@ -239,8 +351,9 @@ if __name__ == "__main__":
     areas = np.array([p["area"] for p in provs], dtype=np.float64)
     print("provinces: {}".format(len(provs)))
     if len(provs):
-        print("area: min={:.0f} max={:.0f} mean={:.0f}".format(
-            areas.min(), areas.max(), areas.mean()))
+        print("area: min={:.0f} max={:.0f} median={:.0f} mean={:.0f} ratio={:.1f}".format(
+            areas.min(), areas.max(), np.median(areas), areas.mean(),
+            areas.max() / areas.min()))
         print("total land covered by provinces: {:.2f}".format(
             float(areas.sum()) / float((height >= 0).sum())))
     for p in provs[:5]:
