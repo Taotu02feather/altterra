@@ -93,12 +93,6 @@ def generate(height):
     return temp, rain, biome
 
 
-_BIOME_NAMES = {
-    0: "ocean", 1: "ice", 2: "tundra", 3: "taiga", 4: "temperate_forest",
-    5: "grassland", 6: "desert", 7: "savanna", 8: "rainforest", 9: "alpine",
-}
-
-
 if __name__ == "__main__":
     import time
     from . import terrain
@@ -112,11 +106,11 @@ if __name__ == "__main__":
     print("biome value range: {} ~ {}".format(biome.min(), biome.max()))
     for code in sorted(np.unique(biome).tolist()):
         frac = float((biome == code).mean())
-        print("  biome {:>2d} {:>16s}: {:.3f}".format(code, _BIOME_NAMES[code], frac))
+        print("  biome {:>2d} {:>16s}: {:.3f}".format(code, config.BIOME_NAMES[code], frac))
     # 按纬度打印一条经线剖面，验证气候带
     col = height.shape[1] // 2
     print("latitude profile (every 64 rows, col={}):".format(col))
     for i in range(0, height.shape[0], 64):
         print("  lat={:+5.0f}  temp={:+.1f}  rain={:.2f}  biome={}".format(
-            -90 + 180 * i / height.shape[0], temp[i, col], rain[i, col], _BIOME_NAMES[int(biome[i, col])]))
+            -90 + 180 * i / height.shape[0], temp[i, col], rain[i, col], config.BIOME_NAMES[int(biome[i, col])]))
     print("elapsed: {:.1f}s".format(time.time() - t0))

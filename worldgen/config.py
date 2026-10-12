@@ -9,3 +9,9 @@ NUM_OCTAVES = 6            # 细节噪声八度数
 EROSION_ITERATIONS = 50    # 侵蚀迭代次数
 TEMP_BASE = 30             # 赤道海平面基准温度（°C）
 LAPSE_RATE = 6.5           # 温度递减率（°C / 1000m）
+
+# 群系编码 -> 名称
+BIOME_NAMES = {
+    0: "ocean", 1: "ice", 2: "tundra", 3: "taiga", 4: "temperate_forest",
+    5: "grassland", 6: "desert", 7: "savanna", 8: "rainforest", 9: "alpine",
+}
