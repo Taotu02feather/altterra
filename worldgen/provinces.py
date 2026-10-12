@@ -3,18 +3,19 @@
 provinces.py — 纯 Voronoi 省份划分
 
 流程：
-1. 密度函数（承载力 + 地形复杂度 + 沿海加成）
+1. 密度函数（承载力 + 地形复杂度 + 沿海加成）+ 高斯平滑
 2. 加权泊松盘采样撒种子点（密度高的地方点多）
-3. Lloyd 松弛 5 次（Voronoi 质心迭代）
-4. 纯 Voronoi 划分（scipy.spatial.Voronoi），直接得到凸多边形
-5. 面积过滤：面积 < 中位数 10% 的省份合并到邻居
+3. Lloyd 松弛 5 次（密度加权质心迭代）
+4. 分割超大省份（面积 > 中位数 × 15）
+5. 纯 Voronoi 划分（scipy.spatial.Voronoi），直接得到凸多边形
+6. 面积过滤：面积 < 中位数 10% 的省份合并到邻居
 
 输出：provinces 列表，每项含 id / polygon / center / area / biome。
 polygon 为 Voronoi 区域顶点（像素坐标，x=列, y=行），center 为像素坐标。
 """
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.spatial import cKDTree, Voronoi, ConvexHull
 
 from . import config
@@ -31,8 +32,8 @@ def label_map():
 def _density(height, biome):
     """密度函数：承载力 + 地形复杂度 + 沿海加成。"""
     land = height >= 0
-    # 承载力权重跨度较大，使肥沃区省份小而贫瘠区省份大（面积比约 20~100）
-    cap_weights = np.array([0.0, 0.01, 0.05, 0.30, 0.85, 0.45, 0.01, 0.45, 2.00, 0.03])
+    # 承载力权重采用温和跨度，避免两极分化（省份大小差异控制在 10~50 倍）
+    cap_weights = np.array([0.0, 0.03, 0.10, 0.35, 0.80, 0.50, 0.03, 0.50, 1.20, 0.06])
     capacity = cap_weights[np.clip(biome, 0, 9).astype(np.int64)]
     gx = np.gradient(np.maximum(height, 0.0), axis=1)
     gy = np.gradient(np.maximum(height, 0.0), axis=0)
@@ -120,15 +121,24 @@ def _lloyd(points, land, iters, weights=None):
     return pts
 
 
+def _assign(points, land):
+    """把每个陆地像素分配到最近种子，返回 (ys, xs, lab)。"""
+    if len(points) == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, empty
+    ys, xs = np.nonzero(land)
+    land_coords = np.c_[ys.astype(np.float64), xs.astype(np.float64)]
+    tree = cKDTree(np.asarray(points, dtype=np.float64))
+    _, lab = tree.query(land_coords)
+    return ys, xs, lab
+
+
 def _filter_by_area(points, land):
     """删除陆地面积极小的种子（面积 < 中位数 10%），让邻居吸收其区域。"""
     if len(points) == 0:
         return np.zeros((0, 2), dtype=np.float64)
-    ys, xs = np.nonzero(land)
-    land_coords = np.c_[ys.astype(np.float64), xs.astype(np.float64)]
     pts = np.asarray(points, dtype=np.float64)
-    tree = cKDTree(pts)
-    _, lab = tree.query(land_coords)
+    _, _, lab = _assign(pts, land)
     counts = np.bincount(lab, minlength=len(pts)).astype(np.float64)
     pos = counts[counts > 0]
     if len(pos) == 0:
@@ -138,6 +148,43 @@ def _filter_by_area(points, land):
     if keep.all():
         return pts
     return pts[keep]
+
+
+def _split_large(points, land, weights, rng, max_ratio=15.0, max_iters=2):
+    """分割超大省份：对面积 > 中位数 × max_ratio 的省份，在其内部随机插 2~4 个新种子。"""
+    pts = np.asarray(points, dtype=np.float64)
+    for _ in range(max_iters):
+        ys, xs, lab = _assign(pts, land)
+        if len(ys) == 0:
+            break
+        counts = np.bincount(lab, minlength=len(pts)).astype(np.float64)
+        pos = counts[counts > 0]
+        if len(pos) == 0:
+            break
+        med = float(np.median(pos))
+        if med <= 0:
+            break
+        large = np.where(counts > max_ratio * med)[0]
+        if len(large) == 0:
+            break
+        new_pts = []
+        for i in large:
+            sel = lab == i
+            n_sel = int(sel.sum())
+            if n_sel < 4:
+                continue
+            # 面积越大插入越多（2~4 个）
+            k = int(np.clip(np.round(1.0 + counts[i] / (max_ratio * med)), 2, 4))
+            k = min(k, n_sel)
+            idx = rng.choice(np.nonzero(sel)[0], size=k, replace=False)
+            for j in idx:
+                new_pts.append((float(ys[j]), float(xs[j])))
+        if len(new_pts) == 0:
+            break
+        pts = np.vstack([pts, np.asarray(new_pts, dtype=np.float64)])
+        # 重新 Lloyd 松弛，让新种子分散到合适位置
+        pts = _lloyd(pts, land, 2, weights=weights)
+    return pts
 
 
 def _voronoi_finite_polygons(vor, radius):
@@ -276,10 +323,7 @@ def _rasterize(points, land, biome, h, w):
     biome_codes = np.zeros(n, dtype=np.int64)
     if n == 0:
         return labels, areas, biome_codes
-    ys, xs = np.nonzero(land)
-    land_coords = np.c_[ys.astype(np.float64), xs.astype(np.float64)]
-    tree = cKDTree(np.asarray(points, dtype=np.float64))
-    _, lab = tree.query(land_coords)
+    ys, xs, lab = _assign(points, land)
     labels[ys, xs] = (lab + 1).astype(np.int32)  # id 从 1 开始
     areas = np.bincount(lab, minlength=n).astype(np.int64)
     for i in range(n):
@@ -302,32 +346,43 @@ def generate(height, biome):
     if land_count == 0:
         return []
 
-    # 1. 加权泊松盘撒种子（略过采样，供面积过滤后仍接近 NUM_PROVINCES）
-    n_seeds = int(round(n * 1.05))
-    min_dist = max(6, int(round(np.sqrt(land_count / max(n_seeds, 1)) * 0.35)))
+    # 密度场高斯平滑（sigma ≈ 2% 地图尺寸）：消除群系硬边界，使高低密度平滑过渡。
+    # 平滑前把海洋填成陆地均值，避免 0 值拉低沿海密度；平滑后海洋重新归零。
+    sigma = max(2.0, 0.02 * max(h, w))
+    fill = float(density[land].mean())
+    smooth_input = np.where(land, density, fill)
+    density = gaussian_filter(smooth_input, sigma=sigma, mode='nearest')
+    density = np.where(land, density, 0.0)
+
+    # 1. 加权泊松盘撒种子（最小间距系数提高到 0.5，低密度区也不至于太稀疏）
+    n_seeds = int(round(n * 1.0))
+    min_dist = max(6, int(round(np.sqrt(land_count / max(n_seeds, 1)) * 0.5)))
     points = _weighted_poisson_disk(density, land, n_seeds, rng, min_dist)
     if len(points) == 0:
         return []
 
-    # 2. Lloyd 松弛 5 次（密度加权；用 density^2.5 强化密度对比，使面积比落到 20~100）
-    weights = density ** 2.5
+    # 2. Lloyd 松弛 5 次（密度权重用 density^2.0，比原来的 ^2.5 温和，保留适度大小差异）
+    weights = density ** 2.0
     points = _lloyd(points, land, 5, weights=weights)
 
-    # 3. 面积过滤（面积 < 中位数 10% 的删除），再松弛收尾
+    # 3. 分割超大省份（面积 > 中位数 × 15），迭代最多 2 次
+    points = _split_large(points, land, weights, rng, max_ratio=15.0, max_iters=2)
+
+    # 4. 面积过滤（面积 < 中位数 10% 的删除），再松弛收尾
     points = _filter_by_area(points, land)
     points = _lloyd(points, land, 3, weights=weights)
 
-    # 4. 纯 Voronoi 多边形（裁剪到地图边界，顶点为像素坐标）
+    # 5. 纯 Voronoi 多边形（裁剪到地图边界，顶点为像素坐标）
     polys = _voronoi_polygons(points, w, h)
 
-    # 5. 离散 Voronoi 标签图（仅陆地）+ 面积 + 群系
+    # 6. 离散 Voronoi 标签图（仅陆地）+ 面积 + 群系
     labels, areas, biome_codes = _rasterize(points, land, biome, h, w)
 
     # 缓存标签图供 render / resources 使用
     global _LABELS
     _LABELS = labels
 
-    # 6. 组装省份列表
+    # 7. 组装省份列表
     provs = []
     for i in range(len(points)):
         provs.append({

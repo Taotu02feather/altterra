@@ -17,7 +17,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.colors import hsv_to_rgb
+from matplotlib.colors import hsv_to_rgb, Normalize
 
 from . import provinces as _prov_mod
 
@@ -160,7 +160,9 @@ def _polygon_data(p, H):
 def _render_capacity(height, provs):
     W, H = height.shape[1], height.shape[0]
     land = height >= 0
+    # 柔和色带：用 vmin/vmax 压缩 farm 到色带中段，避免深绿与浅黄对比过强
     cmap = plt.get_cmap('YlGn')
+    norm = Normalize(vmin=-0.1, vmax=1.1)
 
     fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
@@ -172,7 +174,7 @@ def _render_capacity(height, provs):
         if len(p["polygon"]) < 3:
             continue
         xs, ys = _polygon_data(p, H)
-        ax.fill(xs, ys, facecolor=cmap(p["farm"]), edgecolor='none')
+        ax.fill(xs, ys, facecolor=cmap(norm(p["farm"])), edgecolor='none')
 
     # 盖回海洋（多边形是裁剪到地图边界的 Voronoi 区域，会延伸到海洋）
     ax.imshow(_ocean_overlay(land, (0.04, 0.12, 0.35)),
