@@ -15,3 +15,10 @@ BIOME_NAMES = {
     0: "ocean", 1: "ice", 2: "tundra", 3: "taiga", 4: "temperate_forest",
     5: "grassland", 6: "desert", 7: "savanna", 8: "rainforest", 9: "alpine",
 }
+
+
+if __name__ == "__main__":
+    # 简单测试：打印配置
+    for k, v in sorted(vars().items()):
+        if k.isupper():
+            print("{} = {}".format(k, v))
