@@ -1,11 +1,23 @@
 # -*- coding: utf-8 -*-
 """main.py — AltTerra 一键生成入口。运行 `python main.py` 输出 3 张 PNG。"""
 
+import argparse
 import time
 from worldgen import config, terrain, climate, provinces, resources, render
 
 
 def main():
+    parser = argparse.ArgumentParser(description="AltTerra 地图生成")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="覆盖 config.SEED 的随机种子")
+    args = parser.parse_args()
+
+    seed = config.SEED
+    if args.seed is not None:
+        config.SEED = args.seed
+        seed = args.seed
+    print(f"当前 SEED: {seed}")
+
     t0 = time.time()
     print("[1/5] 生成高度场...")
     height = terrain.generate()
